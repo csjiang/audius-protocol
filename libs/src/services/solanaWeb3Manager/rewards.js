@@ -16,6 +16,7 @@ const BN = require("bn.js")
 const SENDER_SEED_PREFIX = "S_"
 const VERIFY_TRANSFER_SEED_PREFIX = "V_"
 const TRANSFER_PREFIX = "T_"
+const ADD_SENDER_MESSAGE_PREFIX = "add"
 
 // Enum cases for instructions
 const SUBMIT_INSTRUCTION_ENUM_VALUE = 6
@@ -80,6 +81,41 @@ const validateAttestationsInstructionSchema = new Map([
     },
   ],
 ])
+
+class CreateSenderInstructionData {
+  /**
+   * Creates an instance of CreateSenderInstructionData
+   * @param {{
+   *    eth_address: Uint8Array
+   *    operator: Uint8Array
+   * }} {
+   *    eth_address,
+   *    operator
+   * }
+   */
+  constructor({
+    eth_address,
+    operator
+  }) {
+    this.eth_address = eth_address,
+    this.operator = operator
+  }
+}
+
+const createSenderInstructionSchema = new Map(
+  [
+    [
+      CreateSenderInstructionData,
+      {
+        kind: 'struct',
+        fields: [
+          ['eth_address', [20]],
+          ['operator', [20]],
+        ] 
+      }
+    ]
+  ]
+)
 
 /**
  * @typedef {Object} AttestationMeta
@@ -192,6 +228,80 @@ export async function submitAttestations({
     feePayer,
   })
   instructions = [...instructions, oracleSecp, oracleTransfer]
+
+  // Prep transaction to be relayed and send it
+  const relayable = instructions.map(prepareInstructionForRelay)
+  const { blockhash: recentBlockhash } = await connection.getRecentBlockhash()
+  const transactionData = {
+    recentBlockhash,
+    instructions: relayable,
+  }
+
+  try {
+    const response = await identityService.solanaRelay(transactionData)
+    return response
+  } catch (e) {
+    console.error(e.message)
+  }
+}
+
+/**
+ * Creates a new rewards signer (one that can attest)
+ *
+ * @param {{
+ *   rewardManagerProgramId: PublicKey,
+ *   rewardManagerAccount: PublicKey,
+ *   senderEthAddress: string,
+ *   feePayer: PublicKey,
+ *   operatorEthAddress: string,
+ *   attestations: AttestationMeta[],
+ *   identityService: any
+ *   connection: Connection
+ * }} {
+ *   rewardManagerProgramId,
+ *   rewardManagerAccount,
+ *   senderEthAddress,
+ *   feePayer,
+ *   operatorEthAddress,
+ *   attestations,
+ *   identityService,
+ *   connection
+ * }
+ */
+export async function createSender({
+  rewardManagerProgramId,
+  rewardManagerAccount,
+  senderEthAddress,
+  feePayer,
+  operatorEthAddress,
+  signatures,
+  identityService,
+  connection
+}) {
+  const [rewardManagerAuthority] = await findProgramAddressFromPubkey(
+    rewardManagerProgramId,
+    rewardManagerAccount
+  )
+
+  const signerEthAddresses = attestations.map(meta => meta.ethAddress)
+  const signerInstructions = attestations.map(meta => {
+    return generateCreateSenderSecpInstruction({
+      senderEthAddress,
+      meta
+    })
+  })
+
+  const createSenderInstructions = generateCreateSenderInstruction({
+    senderEthAddress,
+    operatorEthAddress,
+    rewardManagerAccount,
+    rewardManagerAuthority,
+    rewardManagerProgramId,
+    feePayer,
+    signerEthAddresses
+  })
+
+  const instructions = [...signerInstructions, ...createSenderInstructions]
 
   // Prep transaction to be relayed and send it
   const relayable = instructions.map(prepareInstructionForRelay)
@@ -562,6 +672,149 @@ const generateSecpInstruction = ({
   })
 }
 
+const generateCreateSenderSecpInstruction = ({
+  ethAddress,
+  attestationMeta
+}) => {
+  // Perform signature manipulations:
+  // - remove the 0x prefix
+  // - lose the final byte / recovery ID
+  let strippedSignature = attestationMeta.signature.replace("0x", "")
+  const recoveryIdStr = strippedSignature.slice(strippedSignature.length - 2)
+  const recoveryId = new BN(recoveryIdStr, "hex").toNumber()
+  strippedSignature = strippedSignature.slice(0, strippedSignature.length - 2)
+  const encodedSignature = Uint8Array.of(
+    ...new BN(strippedSignature, "hex").toArray("be")
+  )
+
+  const encodedSenderMessage = constructCreateSignerMessage(
+    ethAddress
+  )
+  return Secp256k1Program.createInstructionWithEthAddress({
+    ethAddress: attestationMeta.ethAddress,
+    message: encodedSenderMessage,
+    signature: encodedSignature,
+    recoveryId
+  })
+}
+
+/**
+ *
+ * Helper function generate a create sender instruction.
+ * @param {{
+ *   senderEthAddress: string,
+ *   operatorEthAddress: string,
+ *   rewardManagerAccount: PublicKey,
+ *   rewardManagerAuthority: PublicKey,
+ *   rewardManagerProgramId: PublicKey,
+ *   feePayer: PublicKey,
+ *   signerEthAddresses: string[]
+ * }} {
+ *   senderEthAddress,
+ *   operatorEthAddress,
+ *   rewardManagerAccount,
+ *   rewardManagerAuthority,
+ *   rewardManagerProgramId,
+ *   feePayer,
+ *   signerEthAddresses
+ * }
+ * @returns {TransactionInstruction}
+ */
+const generateCreateSenderInstruction = ({
+  senderEthAddress,
+  operatorEthAddress,
+  rewardManagerAccount,
+  rewardManagerAuthority,
+  rewardManagerProgramId,
+  feePayer,
+  signerEthAddresses
+}) => {
+  // Get the DN's derived Solana address from the eth pubkey
+  const derivedSenderSolanaAddress = await deriveSolanaSenderFromEthAddress(
+    senderEthAddress,
+    rewardManagerProgramId,
+    rewardManagerAccount
+  )
+
+  const signerSolanaPubKeys = signerEthAddresses.map(async signerEthAddress =>
+    deriveSolanaSenderFromEthAddress(
+      signerEthAddress,
+      rewardManagerProgramId,
+      rewardManagerAccount
+    )
+  )
+
+  /// 0. `[]` Reward manager
+  /// 1. `[]` Reward manager authority
+  /// 2. `[signer]` Funder
+  /// 3. `[writable]` new_sender
+  /// 4. `[]` Bunch of senders which prove creating another one
+  let createSenderInstructionAccounts = [
+    {
+      pubkey: rewardManagerAccount,
+      isSigner: false,
+      isWritable: false,
+    },
+    {
+      pubkey: rewardManagerAuthority,
+      isSigner: false,
+      isWritable: true,
+    },
+    {
+      pubkey: feePayer,
+      isSigner: true,
+      isWritable: true,
+    },
+    {
+      pubkey: derivedSenderSolanaAddress,
+      isSigner: false,
+      isWritable: true,
+    },
+    {
+      pubkey: SYSVAR_RENT_PUBKEY,
+      isSigner: false,
+      isWritable: false,
+    },
+    {
+      pubkey: SYSVAR_INSTRUCTIONS_PUBKEY,
+      isSigner: false,
+      isWritable: false,
+    },
+    {
+      pubkey: SystemProgram.programId,
+      isSigner: false,
+      isWritable: false,
+    },
+    ...signerSolanaPubKeys.map(pubkey =>
+      ({
+        pubkey,
+        isSigner: false,
+        isWritable: false
+      })
+    )
+  ]
+
+  const createSenderInstructionData = new CreateSenderInstructionData({
+    eth_address: senderEthAddress,
+    operator: operatorEthAddress
+  })
+  const serializedInstructionData = borsh.serialize(
+    createSenderInstructionSchema,
+    createSenderInstructionData
+  )
+  const serializedInstructionEnum = Buffer.from(Uint8Array.of(
+      2,
+      ...serializedInstructionData
+  ))
+
+  return new TransactionInstruction({
+      keys: createSenderInstructionAccounts,
+      programId: rewardManagerProgramId,
+      data: serializedInstructionEnum
+  })
+}
+
+
 // Misc
 
 /**
@@ -644,6 +897,24 @@ const deriveSolanaSenderFromEthAddress = async (
     new Uint8Array([...encodedPrefix, ...ethAddressArr])
   )
   return derivedSender
+}
+
+/**
+ * Constructs a create signer message for an existing "signer" eth address
+ * @param {string} ethAddress 
+ * @returns {Uint8Array}
+ */
+const constructCreateSignerMessage = (
+  ethAddress
+) => {
+  const ethAddressArr = ethAddressToArray(ethAddress)
+  const encodedPrefix = encoder.encode(ADD_SENDER_MESSAGE_PREFIX)
+
+  const items = [encodedPrefix, rewardManagerPubKey, ethAddressArr]
+  const res = items.slice(1).reduce((prev, cur, i) => {
+    return Uint8Array.of(...prev, ...cur)
+  }, Uint8Array.from(items[0]))
+  return res
 }
 
 /**
